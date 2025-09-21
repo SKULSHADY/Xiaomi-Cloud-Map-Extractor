@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import base64
 from typing import Any, Self, Mapping
 
 import voluptuous as vol
@@ -22,7 +23,8 @@ from vacuum_map_parser_base.config.drawable import Drawable
 from vacuum_map_parser_base.config.image_config import ImageConfig
 from vacuum_map_parser_base.config.size import Sizes
 
-from .connector.utils.exceptions import XiaomiCloudMapExtractorException, TwoFactorAuthRequiredException
+from .connector.utils.exceptions import XiaomiCloudMapExtractorException, TwoFactorAuthRequiredException, \
+    CaptchaRequiredException
 from .connector.vacuums.base.model import VacuumApi
 from .connector.xiaomi_cloud.connector import XiaomiCloudConnector, XiaomiCloudDeviceInfo
 from .connector.xiaomi_cloud.const import AVAILABLE_SERVERS
@@ -41,7 +43,8 @@ from .const import (
     CONF_IMAGE_CONFIG_TRIM_LEFT,
     CONF_IMAGE_CONFIG_TRIM_BOTTOM,
     CONF_IMAGE_CONFIG_TRIM_TOP,
-    CONF_IMAGE_CONFIG_TRIM_RIGHT
+    CONF_IMAGE_CONFIG_TRIM_RIGHT,
+    CONF_CAPTCHA_CODE,
 )
 from .options_flow import XiaomiCloudMapExtractorOptionsFlowHandler
 from .types import XiaomiCloudMapExtractorConfigEntry
@@ -65,11 +68,14 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
 
     def __init__(self) -> None:
         """Initialize."""
-        self.username = None
-        self.password = None
-        self.server = None
-        self.cloud_vacuums: list[XiaomiCloudDeviceInfo] = []
-        self.cloud_vacuum: XiaomiCloudDeviceInfo | None = None
+        self._username: str | None = None
+        self._password: str | None = None
+        self._server: str | None = None
+        self._cloud_vacuums: list[XiaomiCloudDeviceInfo] = []
+        self._cloud_vacuum: XiaomiCloudDeviceInfo | None = None
+        self._connector: XiaomiCloudConnector | None = None
+        self._captcha_image_data: bytes | None = None
+        self._two_factor_url: str | None = None
 
     @staticmethod
     @callback
@@ -104,19 +110,22 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
         errors = {}
         if user_input is not None:
 
-            username = user_input.get(CONF_USERNAME)
-            password = user_input.get(CONF_PASSWORD)
-            server = user_input.get(CONF_SERVER)
+            self._username = user_input.get(CONF_USERNAME)
+            self._password = user_input.get(CONF_PASSWORD)
+            self._server = user_input.get(CONF_SERVER)
             session_creator = lambda: async_create_clientsession(self.hass)
 
-            connector = XiaomiCloudConnector(session_creator, username, password, server)
-            two_factor_url = None
+            self._connector = XiaomiCloudConnector(session_creator, self._username, self._password, self._server)
             try:
-                if await connector.login() is None:
+                if await self._connector.login() is None:
                     errors["base"] = "cloud_login_error"
+            except CaptchaRequiredException as e:
+                self._captcha_image_data = e.image_data
+                return await self.async_step_auth_captcha()
             except TwoFactorAuthRequiredException as e:
                 errors["base"] = "two_factor_auth_required"  # todo 2fa
-                two_factor_url = e.url
+                self._two_factor_url = e.url
+
             except XiaomiCloudMapExtractorException:
                 errors["base"] = "cloud_login_error"
             except Exception as e:
@@ -126,37 +135,40 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
 
             if errors:
                 return self.async_show_form(
-                    step_id="cloud", data_schema=CLOUD_SCHEMA, errors=errors,
-                    description_placeholders={"two_factor_url": two_factor_url}
-                )
-
-            try:
-                devices_raw = await connector.get_devices(server)
-            except Exception as e:
-                _LOGGER.error("Unexpected exception while attempting to Miio cloud get devices")
-                _LOGGER.error(e, exc_info=True)
-                return self.async_abort(reason="unknown")
-
-            if not devices_raw:
-                errors[CONF_SERVER] = "cloud_no_devices"
-                return self.async_show_form(
                     step_id="cloud", data_schema=CLOUD_SCHEMA, errors=errors
                 )
-
-            self.username = username
-            self.password = password
-            self.server = server
-            self.cloud_vacuums = [device for device in devices_raw if "vacuum" in device.spec_type]
-
-            if len(self.cloud_vacuums) == 1:
-                self.cloud_vacuum = self.cloud_vacuums[0]
-                return await self.async_step_confirm_data()
-
-            return await self.async_step_select_vacuum()
-
+            return await self._after_auth()
         return self.async_show_form(
             step_id="cloud", data_schema=CLOUD_SCHEMA, errors=errors
         )
+
+    async def _after_auth(self) -> ConfigFlowResult:
+
+        try:
+            devices_raw = await self._connector.get_devices(self._server)
+        except Exception as e:
+            _LOGGER.error(
+                "Unexpected exception while attempting to Miio cloud get devices"
+            )
+            _LOGGER.error(e, exc_info=True)
+            return self.async_abort(reason="unknown")
+
+        if not devices_raw:
+            return self.async_show_form(
+                step_id="cloud",
+                data_schema=CLOUD_SCHEMA,
+                errors={CONF_SERVER: "cloud_no_devices"},
+            )
+
+        self._cloud_vacuums = [
+            device for device in devices_raw if "vacuum" in device.spec_type
+        ]
+
+        if len(self._cloud_vacuums) == 1:
+            self._cloud_vacuum = self._cloud_vacuums[0]
+            return await self.async_step_confirm_data()
+
+        return await self.async_step_select_vacuum()
 
     async def async_step_select_vacuum(
             self, user_input: dict[str, Any] | None = None
@@ -164,13 +176,13 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
         """Handle multiple cloud devices found."""
         errors: dict[str, str] = {}
         if user_input is not None:
-            self.cloud_vacuum = next(filter(lambda v: v.device_id == user_input["select_vacuum"], self.cloud_vacuums))
+            self._cloud_vacuum = next(filter(lambda v: v.device_id == user_input["select_vacuum"], self._cloud_vacuums))
             return await self.async_step_confirm_data()
 
         options: list[SelectOptionDict] = [
             SelectOptionDict(value=cloud_vacuum.device_id,
                              label=f"{cloud_vacuum.name} - {cloud_vacuum.model} ({cloud_vacuum.mac})")
-            for cloud_vacuum in self.cloud_vacuums
+            for cloud_vacuum in self._cloud_vacuums
         ]
 
         select_schema = vol.Schema(
@@ -199,7 +211,7 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
             if not await self._validate_vacuum(host, token, VacuumApi(used_map_api)):
                 errors["base"] = "invalid_vacuum"
             else:
-                unique_id = format_mac(self.cloud_vacuum.mac)
+                unique_id = format_mac(self._cloud_vacuum.mac)
                 existing_entry = await self.async_set_unique_id(
                     unique_id, raise_on_progress=False
                 )
@@ -207,28 +219,28 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
                     data = existing_entry.data.copy()
                     data[CONF_HOST] = host
                     data[CONF_TOKEN] = token
-                    data[CONF_DEVICE_ID] = self.cloud_vacuum.device_id,
-                    data[CONF_MODEL] = self.cloud_vacuum.model
-                    data[CONF_MAC] = format_mac(self.cloud_vacuum.mac)
-                    data[CONF_NAME] = self.cloud_vacuum.name
-                    data[CONF_USERNAME] = self.username
-                    data[CONF_PASSWORD] = self.password
-                    data[CONF_SERVER] = self.server
+                    data[CONF_DEVICE_ID] = self._cloud_vacuum.device_id,
+                    data[CONF_MODEL] = self._cloud_vacuum.model
+                    data[CONF_MAC] = format_mac(self._cloud_vacuum.mac)
+                    data[CONF_NAME] = self._cloud_vacuum.name
+                    data[CONF_USERNAME] = self._username
+                    data[CONF_PASSWORD] = self._password
+                    data[CONF_SERVER] = self._server
                     data[CONF_USED_MAP_API] = used_map_api
                     return self.async_update_reload_and_abort(existing_entry, data=data)
                 else:
                     return self.async_create_entry(
-                        title=self.cloud_vacuum.name,
+                        title=self._cloud_vacuum.name,
                         data={
                             CONF_HOST: host,
                             CONF_TOKEN: token,
-                            CONF_DEVICE_ID: self.cloud_vacuum.device_id,
-                            CONF_MODEL: self.cloud_vacuum.model,
-                            CONF_MAC: format_mac(self.cloud_vacuum.mac),
-                            CONF_NAME: self.cloud_vacuum.name,
-                            CONF_USERNAME: self.username,
-                            CONF_PASSWORD: self.password,
-                            CONF_SERVER: self.server,
+                            CONF_DEVICE_ID: self._cloud_vacuum.device_id,
+                            CONF_MODEL: self._cloud_vacuum.model,
+                            CONF_MAC: format_mac(self._cloud_vacuum.mac),
+                            CONF_NAME: self._cloud_vacuum.name,
+                            CONF_USERNAME: self._username,
+                            CONF_PASSWORD: self._password,
+                            CONF_SERVER: self._server,
                             CONF_USED_MAP_API: used_map_api,
                         },
                         options={
@@ -244,13 +256,13 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
                         }
                     )
 
-        detected_api = VacuumApi.detect(self.cloud_vacuum.model)
+        detected_api = VacuumApi.detect(self._cloud_vacuum.model)
         api_options: list[SelectOptionDict] = [
             SelectOptionDict(value=v, label=v.title() + (" *" if v == detected_api else "")) for v in VacuumApi
         ]
         confirm_data_schema = vol.Schema({
-            vol.Required(CONF_HOST, default=self.cloud_vacuum.local_ip): str,
-            vol.Required(CONF_TOKEN, default=self.cloud_vacuum.token): vol.All(str, vol.Length(min=32, max=32)),
+            vol.Required(CONF_HOST, default=self._cloud_vacuum.local_ip): str,
+            vol.Required(CONF_TOKEN, default=self._cloud_vacuum.token): vol.All(str, vol.Length(min=32, max=32)),
             vol.Required(CONF_USED_MAP_API, default=detected_api): SelectSelector(
                 SelectSelectorConfig(
                     options=api_options,
@@ -262,6 +274,47 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="confirm_data", data_schema=confirm_data_schema, errors=errors, last_step=True
+        )
+
+    async def async_step_auth_captcha(
+            self, user_input: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
+        """Captcha verification step."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            captcha_code = user_input[CONF_CAPTCHA_CODE]
+            try:
+                await self._connector.continue_login_with_captcha(captcha_code)
+                return await self._after_auth()
+            except CaptchaRequiredException as e:
+                errors[CONF_CAPTCHA_CODE] = "invalid_captcha"
+                self._captcha_image_data = e.image_data
+            except TwoFactorAuthRequiredException as e:
+                errors["base"] = "two_factor_auth_required"  # todo 2fa
+                self._two_factor_url = e.url
+            except XiaomiCloudMapExtractorException:
+                errors["base"] = "cloud_login_error"
+            except Exception as e:
+                _LOGGER.error("Unexpected exception while attempting Miio cloud login")
+                _LOGGER.error(e, exc_info=True)
+                return self.async_abort(reason="unknown")
+
+        captcha_image_b64 = base64.b64encode(self._captcha_image_data).decode("utf-8")
+
+        return self.async_show_form(
+            step_id="auth_captcha",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_CAPTCHA_CODE
+                    ): str
+                }
+            ),
+            errors=errors,
+            description_placeholders={
+                "captcha_image_b64": captcha_image_b64
+            },
         )
 
     async def _validate_vacuum(self: Self, host: str, token: str, used_map_api: VacuumApi) -> bool:

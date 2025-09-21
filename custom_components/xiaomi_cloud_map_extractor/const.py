@@ -18,6 +18,8 @@ DEFAULT_UPDATE_INTERVAL: Final = timedelta(seconds=10)
 CONF_USED_MAP_API: Final = "used_map_api"
 CONF_SERVER: Final = "server"
 
+CONF_CAPTCHA_CODE: Final = "captcha_code"
+
 CONF_IMAGE_CONFIG: Final = "image_config"
 CONF_IMAGE_CONFIG_SCALE: Final = "scale"
 CONF_IMAGE_CONFIG_ROTATE: Final = "rotate"

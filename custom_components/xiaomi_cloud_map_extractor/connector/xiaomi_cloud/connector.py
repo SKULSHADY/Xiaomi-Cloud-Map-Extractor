@@ -22,7 +22,8 @@ from ..utils.exceptions import (
     TwoFactorAuthRequiredException,
     InvalidCredentialsException,
     FailedLoginException,
-    FailedConnectionException
+    FailedConnectionException,
+    CaptchaRequiredException
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ class XiaomiCloudConnector:
     _session_data: XiaomiCloudSessionData | None
     _locale: str
     _timezone: str
+    _sign: str | None
     server: str | None
 
     def __init__(self: Self, session_creator: Callable[[], ClientSession], username: str, password: str,
@@ -88,16 +90,16 @@ class XiaomiCloudConnector:
         self._timezone = f"GMT{timezone[:-2]}:{timezone[-2:]}"
         self.server = server
         self._session_data = None
+        self.device_id = generate_device_id()
 
     async def create_session(self: Self) -> None:
         if self._session_data is not None and self._session_data.session is not None:
             self._session_data.session.detach()
         agent = generate_agent()
-        device_id = generate_device_id()
         session = self._session_creator()
         cookies = {
             "sdkVerdion": "accountsdk-18.8.15",
-            "deviceId": device_id
+            "deviceId": self.device_id
         }
         session.cookie_jar.update_cookies(cookies, response_url=URL("mi.com"))
         session.cookie_jar.update_cookies(cookies, response_url=URL("xiaomi.com"))
@@ -130,7 +132,7 @@ class XiaomiCloudConnector:
         _LOGGER.debug("Xiaomi cloud login - step 1 sign missing")
         return ""
 
-    async def _login_step_2(self: Self, sign: str) -> str:
+    async def _login_step_2(self: Self, sign: str, captcha_code: str | None = None) -> str:
         _LOGGER.debug("Xiaomi cloud login - step 2")
         url = "https://account.xiaomi.com/pass/serviceLoginAuth2"
         params = {
@@ -142,8 +144,8 @@ class XiaomiCloudConnector:
             "_sign": sign,
             "_json": "true"
         }
-        if sign:
-            params["_sign"] = sign
+        if captcha_code:
+            params["captCode"] = captcha_code
         try:
             response = await self._session_data.post(url, params=params)
             _LOGGER.debug("Xiaomi cloud login - step 2 status: %s", response.status)
@@ -162,13 +164,20 @@ class XiaomiCloudConnector:
                 self.two_factor_auth_url = None
                 return location
             else:
-                if "notificationUrl" in response_json:
+                if (two_factor_url := response_json.get("notificationUrl", None)) is not None:
                     _LOGGER.error(
                         "Additional authentication required. " +
                         "Open following URL using device that has the same public IP, " +
                         "as your Home Assistant instance: %s ",
-                        response_json["notificationUrl"])
-                    raise TwoFactorAuthRequiredException(response_json["notificationUrl"])
+                        two_factor_url)
+                    raise TwoFactorAuthRequiredException(two_factor_url)
+                elif (captcha_url := response_json.get("captchaUrl", None)) is not None:
+                    self._sign = sign
+                    if captcha_url.startswith("/"):
+                        captcha_url = "https://account.xiaomi.com" + response_json["captchaUrl"]
+                    captcha_response = await self._session_data.get(captcha_url)
+                    captcha_data = await captcha_response.read()
+                    raise CaptchaRequiredException(captcha_url, captcha_data)
         raise InvalidCredentialsException()
 
     async def _login_step_3(self: Self, location: str) -> None:
@@ -194,6 +203,15 @@ class XiaomiCloudConnector:
         else:
             location = sign
         await self._login_step_3(location)
+        _LOGGER.debug("Logged in.")
+        return self._session_data.serviceToken
+
+    async def continue_login_with_captcha(self: Self, captcha_code: str) -> str | None:
+        _LOGGER.debug("Continuing login with captcha entered.")
+
+        location = await self._login_step_2(self._sign, captcha_code)
+        await self._login_step_3(location)
+
         _LOGGER.debug("Logged in.")
         return self._session_data.serviceToken
 

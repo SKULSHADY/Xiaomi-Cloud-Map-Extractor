@@ -38,3 +38,9 @@ class FailedMapParseException(XiaomiCloudMapExtractorException):
 @dataclass
 class TwoFactorAuthRequiredException(XiaomiCloudMapExtractorException):
     url: str
+
+
+@dataclass
+class CaptchaRequiredException(XiaomiCloudMapExtractorException):
+    url: str
+    image_data: bytes
