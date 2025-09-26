@@ -38,6 +38,8 @@ class FailedMapParseException(XiaomiCloudMapExtractorException):
 @dataclass
 class TwoFactorAuthRequiredException(XiaomiCloudMapExtractorException):
     url: str
+    headers: dict[str, str]
+    context: str
 
 
 @dataclass

@@ -8,7 +8,6 @@
     "error": {
       "invalid_captcha": "Invalid captcha provided, try again.",
       "cloud_login_error": "Could not login to Xiaomi Miio Cloud, check the credentials.",
-      "two_factor_auth_required": "Two factor authentication required. Use the following url and try again {two_factor_url}.",
       "cloud_no_devices": "No vacuums found in this Xiaomi Miio cloud account.",
       "invalid_vacuum": "Connection to vacuum failed, please check the configuration."
     },
@@ -28,6 +27,13 @@
         },
         "description": "Please provide the code from the following image:\n![](data:image/jpeg;base64,{captcha_image_b64})",
         "title": "Captcha"
+      },
+      "auth_two_factor": {
+        "data": {
+          "two_factor_code": "Two-factor code"
+        },
+        "description": "Please provide the two-factor authentication code from the email.",
+        "title": "Two-factor authentication"
       },
       "confirm_data": {
         "data": {

@@ -45,6 +45,7 @@ from .const import (
     CONF_IMAGE_CONFIG_TRIM_TOP,
     CONF_IMAGE_CONFIG_TRIM_RIGHT,
     CONF_CAPTCHA_CODE,
+    CONF_TWO_FACTOR_CODE,
 )
 from .options_flow import XiaomiCloudMapExtractorOptionsFlowHandler
 from .types import XiaomiCloudMapExtractorConfigEntry
@@ -74,8 +75,8 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
         self._cloud_vacuums: list[XiaomiCloudDeviceInfo] = []
         self._cloud_vacuum: XiaomiCloudDeviceInfo | None = None
         self._connector: XiaomiCloudConnector | None = None
-        self._captcha_image_data: bytes | None = None
-        self._two_factor_url: str | None = None
+        self._captcha_exception: CaptchaRequiredException | None = None
+        self._two_factor_exception: TwoFactorAuthRequiredException | None = None
 
     @staticmethod
     @callback
@@ -120,12 +121,11 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
                 if await self._connector.login() is None:
                     errors["base"] = "cloud_login_error"
             except CaptchaRequiredException as e:
-                self._captcha_image_data = e.image_data
+                self._captcha_exception = e
                 return await self.async_step_auth_captcha()
             except TwoFactorAuthRequiredException as e:
-                errors["base"] = "two_factor_auth_required"  # todo 2fa
-                self._two_factor_url = e.url
-
+                self._two_factor_exception = e
+                return await self.async_step_auth_two_factor()
             except XiaomiCloudMapExtractorException:
                 errors["base"] = "cloud_login_error"
             except Exception as e:
@@ -289,18 +289,18 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
                 return await self._after_auth()
             except CaptchaRequiredException as e:
                 errors[CONF_CAPTCHA_CODE] = "invalid_captcha"
-                self._captcha_image_data = e.image_data
+                self._captcha_exception = e
             except TwoFactorAuthRequiredException as e:
-                errors["base"] = "two_factor_auth_required"  # todo 2fa
-                self._two_factor_url = e.url
+                self._two_factor_exception = e
+                return await self.async_step_auth_two_factor()
             except XiaomiCloudMapExtractorException:
                 errors["base"] = "cloud_login_error"
             except Exception as e:
                 _LOGGER.error("Unexpected exception while attempting Miio cloud login")
                 _LOGGER.error(e, exc_info=True)
                 return self.async_abort(reason="unknown")
-
-        captcha_image_b64 = base64.b64encode(self._captcha_image_data).decode("utf-8")
+        captcha_image_data = self._captcha_exception.image_data
+        captcha_image_b64 = base64.b64encode(captcha_image_data).decode("utf-8")
 
         return self.async_show_form(
             step_id="auth_captcha",
@@ -315,6 +315,39 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
             description_placeholders={
                 "captcha_image_b64": captcha_image_b64
             },
+        )
+
+    async def async_step_auth_two_factor(
+            self, user_input: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
+        """Two-factor auth verification step."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            two_factor_code = user_input[CONF_TWO_FACTOR_CODE]
+            try:
+                await self._connector.continue_login_with_two_factor(two_factor_code, self._two_factor_exception)
+                return await self._after_auth()
+            except TwoFactorAuthRequiredException as e:
+                self._two_factor_exception = e
+                return await self.async_step_auth_two_factor()
+            except XiaomiCloudMapExtractorException:
+                errors["base"] = "cloud_login_error"
+            except Exception as e:
+                _LOGGER.error("Unexpected exception while attempting Miio cloud login")
+                _LOGGER.error(e, exc_info=True)
+                return self.async_abort(reason="unknown")
+
+        return self.async_show_form(
+            step_id="auth_two_factor",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_TWO_FACTOR_CODE
+                    ): str
+                }
+            ),
+            errors=errors,
         )
 
     async def _validate_vacuum(self: Self, host: str, token: str, used_map_api: VacuumApi) -> bool:

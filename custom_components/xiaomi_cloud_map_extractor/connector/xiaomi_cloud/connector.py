@@ -6,9 +6,11 @@ import json
 import locale
 import logging
 import time
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Optional, Self, Unpack
+from urllib.parse import parse_qs, urlparse
 
 import tzlocal
 from aiohttp import ClientSession, ClientResponse
@@ -165,12 +167,12 @@ class XiaomiCloudConnector:
                 return location
             else:
                 if (two_factor_url := response_json.get("notificationUrl", None)) is not None:
-                    _LOGGER.error(
+                    _LOGGER.warning(
                         "Additional authentication required. " +
                         "Open following URL using device that has the same public IP, " +
                         "as your Home Assistant instance: %s ",
                         two_factor_url)
-                    raise TwoFactorAuthRequiredException(two_factor_url)
+                    await self._raise_two_factor_exception(two_factor_url)
                 elif (captcha_url := response_json.get("captchaUrl", None)) is not None:
                     self._sign = sign
                     if captcha_url.startswith("/"):
@@ -214,6 +216,244 @@ class XiaomiCloudConnector:
 
         _LOGGER.debug("Logged in.")
         return self._session_data.serviceToken
+
+    async def _raise_two_factor_exception(self, notification_url: str) -> None:
+        """
+        Begins the 2FA email flow by starting the process and raising TwoFactorAuthRequiredException
+        with data needed to continue the authentication.
+        """
+        agent = generate_agent()
+        # 1) Open notificationUrl (authStart)
+        headers = {
+            "User-Agent": agent,
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        _LOGGER.debug("Opening notificationUrl (authStart): %s", notification_url)
+        # self._log_cookies("before authStart")  # Method not implemented
+        r = await self._session_data.get(notification_url, headers=headers)
+        _LOGGER.debug("authStart final URL: %s status=%s", r.url, r.status)
+
+        # 2) Fetch identity options (list)
+        context = parse_qs(urlparse(notification_url).query)["context"][0]
+        list_params = {
+            "sid": "xiaomiio",
+            "context": context,
+            "_locale": "en_US"
+        }
+        _LOGGER.debug("GET /identity/list params=%s", list_params)
+        # self._log_cookies("before identity/list")  # Method not implemented
+        r = await self._session_data.get("https://account.xiaomi.com/identity/list", params=list_params, headers=headers)
+        _LOGGER.debug("identity/list status=%s", r.status)
+        # self._log_cookies("after identity/list")  # Method not implemented
+
+        # 3) Request email ticket
+        send_params = {
+            "_dc": str(int(time.time() * 1000)),
+            "sid": "xiaomiio",
+            "context": list_params["context"],
+            "mask": "0",
+            "_locale": "en_US"
+        }
+        send_data = {
+            "retry": "0",
+            "icode": "",
+            "_json": "true",
+            "ick": ""  # Cookie access would need proper implementation
+        }
+        _LOGGER.debug("sendEmailTicket POST url=https://account.xiaomi.com/identity/auth/sendEmailTicket params=%s", send_params)
+        _LOGGER.debug("sendEmailTicket data=%s", send_data)
+        # self._log_cookies("before sendEmailTicket")  # Method not implemented
+        r = await self._session_data.post("https://account.xiaomi.com/identity/auth/sendEmailTicket",
+                                          params=send_params, data=send_data, headers=headers)
+        # self._log_cookies("after sendEmailTicket")  # Method not implemented
+        try:
+            jr = await r.json()
+        except Exception:
+            jr = {}
+        _LOGGER.debug("sendEmailTicket response status=%s json=%s", r.status, jr)
+
+        # 4) Ask user for the email code and verify
+        # Store session state and raise exception for Home Assistant to handle
+        session_state = {
+            "headers": headers,
+            "list_params": list_params,
+            "send_params": send_params,
+            "context": context
+        }
+        _LOGGER.debug("Raising TwoFactorAuthRequiredException with url=%s, context=%s", notification_url, context)
+        raise TwoFactorAuthRequiredException(
+            url=notification_url,
+            headers=headers,
+            context=context
+        )
+
+    async def continue_login_with_two_factor(self, code: str, exception: TwoFactorAuthRequiredException) -> bool:
+        """Continues the 2FA email flow with the provided verification code."""
+        headers = exception.headers
+        context = exception.context
+
+        # Some endpoints are picky about Referer/Origin
+        headers.setdefault("Referer", "https://account.xiaomi.com/identity/auth/sendEmailTicket")
+        headers.setdefault("Origin", "https://account.xiaomi.com")
+
+        # Grab 'ick' cookie if present – Xiaomi often validates it with the code
+        try:
+            ick_cookie = self._session_data.session.cookie_jar.filter_cookies(
+                "https://account.xiaomi.com"
+            ).get("ick")
+            ick_value = ick_cookie.value if ick_cookie else ""
+        except Exception:
+            ick_value = ""
+
+        verify_params = {
+            "_flag": "8",
+            "_json": "true",
+            "sid": "xiaomiio",
+            "context": context,
+            "mask": "0",
+            "_locale": "en_US"
+        }
+        verify_data = {
+            "_flag": "8",
+            "ticket": code,
+            "trust": "false",
+            "_json": "true",
+            "ick": ick_value
+        }
+        # self._log_cookies("before verifyEmail")  # Method not implemented
+        r = await self._session_data.post("https://account.xiaomi.com/identity/auth/verifyEmail",
+                                          params=verify_params, data=verify_data, headers=headers)
+        # self._log_cookies("after verifyEmail")  # Method not implemented
+        if r.status != 200:
+            _LOGGER.error("verifyEmail failed: status=%s body=%s", r.status, (await r.text())[:500])
+            return False
+
+        finish_loc = None
+        try:
+            jr = await r.json()
+            _LOGGER.debug("verifyEmail response status=%s json=%s", r.status, jr)
+            finish_loc = jr.get("location")
+        except Exception:
+            # Non-JSON or empty; try to extract from headers or body
+            _LOGGER.debug("verifyEmail returned non-JSON, attempting fallback extraction.")
+            finish_loc = r.headers.get("Location")
+            text = await r.text()
+            if not finish_loc and text:
+                m = re.search(r'https://account\.xiaomi\.com/identity/result/check\?[^"\']+', text)
+                if m:
+                    finish_loc = m.group(0)
+
+        # Fallback: directly hit result/check using existing identity_session/context
+        if not finish_loc:
+            _LOGGER.debug("Using fallback call to /identity/result/check")
+            r0 = await self._session_data.get(
+                "https://account.xiaomi.com/identity/result/check",
+                params={"sid": "xiaomiio", "context": context, "_locale": "en_US"},
+                headers=headers,
+                allow_redirects=False
+            )
+            _LOGGER.debug("result/check (fallback) status=%s hop-> %s", r0.status, r0.headers.get("Location"))
+            if r0.status in (301, 302) and r0.headers.get("Location"):
+                finish_loc = r0.url if "serviceLoginAuth2/end" in str(r0.url) else r0.headers["Location"]
+
+        if not finish_loc:
+            _LOGGER.error("Unable to determine finish location after verifyEmail.")
+            return False
+
+        # self._log_cookies("before finish_2fa chain")  # Method not implemented
+
+        # First hop: GET identity/result/check (do NOT follow redirects to inspect Location)
+        if "identity/result/check" in finish_loc:
+            r = await self._session_data.get(finish_loc, headers=headers, allow_redirects=False)
+            _LOGGER.debug("result/check status=%s hop-> %s", r.status, r.headers.get("Location"))
+            end_url = r.headers.get("Location")
+        else:
+            end_url = finish_loc
+
+        if not end_url:
+            _LOGGER.error("Could not find Auth2/end URL in finish chain.")
+            return False
+
+        # 6) Call Auth2/end WITHOUT redirects to capture 'extension-pragma' header containing ssecurity
+        r = await self._session_data.get(end_url, headers=headers, allow_redirects=False)
+        _LOGGER.debug("Auth2/end status=%s", r.status)
+        text = await r.text()
+        _LOGGER.debug("Auth2/end body(trunc)=%s", text[:200])
+        # Some servers return 200 first (HTML 'Tips' page), then 302 on next call.
+        if r.status == 200 and "Xiaomi Account - Tips" in text:
+            r = await self._session_data.get(end_url, headers=headers, allow_redirects=False)
+            _LOGGER.debug("Auth2/end(second) status=%s", r.status)
+
+        ext_prag = r.headers.get("extension-pragma")
+        if ext_prag:
+            try:
+                ep_json = json.loads(ext_prag)
+                ssec = ep_json.get("ssecurity")
+                psec = ep_json.get("psecurity")
+                _LOGGER.debug("extension-pragma present. ssecurity=%s psecurity=%s", ssec, psec)
+                if ssec:
+                    self._session_data.ssecurity = ssec
+            except Exception as e:
+                _LOGGER.debug("Failed to parse extension-pragma: %s", e)
+
+        if not self._session_data.ssecurity:
+            _LOGGER.error("extension-pragma header missing ssecurity; cannot continue.")
+            return False
+
+        # 7) Find STS redirect and visit it (to set serviceToken cookie)
+        sts_url = r.headers.get("Location")
+        if not sts_url:
+            text = await r.text()
+            if text:
+                idx = text.find("https://sts.api.io.mi.com/sts")
+                if idx != -1:
+                    end = text.find('"', idx)
+                    if end == -1:
+                        end = idx + 300
+                    sts_url = text[idx:end]
+        if not sts_url:
+            _LOGGER.error("Auth2/end did not provide STS redirect.")
+            return False
+
+        r = await self._session_data.get(sts_url, headers=headers, allow_redirects=True)
+        _LOGGER.debug("STS final URL: %s status=%s", r.url, r.status)
+        # self._log_cookies("after STS")  # Method not implemented
+        if r.status != 200:
+            text = await r.text()
+            _LOGGER.error("STS did not complete: status=%s body=%s", r.status, text[:200])
+            return False
+
+        # Extract serviceToken from cookie jar (use full URL for aiohttp CookieJar)
+        try:
+            sts_cookies = self._session_data.session.cookie_jar.filter_cookies(str(r.url))
+            service_token = sts_cookies.get("serviceToken")
+            if service_token:
+                self._session_data.serviceToken = service_token.value
+        except Exception:
+            pass
+        found = bool(self._session_data.serviceToken)
+        text = await r.text()
+        _LOGGER.debug("STS body (trunc)=%s", text[:20])
+        if not found:
+            _LOGGER.error("Could not parse serviceToken; cannot complete login.")
+            return False
+        _LOGGER.debug("STS did not return JSON; assuming 'ok' style response and relying on cookies.")
+        _LOGGER.debug("extract_service_token: found=%s", found)
+
+        # Mirror serviceToken to API domains expected by Mi Cloud
+        # self.install_service_token_cookies(self._serviceToken)  # Method not implemented
+
+        # Update ids from cookies if available
+        user_id_cookie = self._session_data.session.cookie_jar.filter_cookies("https://account.xiaomi.com").get("userId") or \
+                         self._session_data.session.cookie_jar.filter_cookies("https://sts.api.io.mi.com").get("userId")
+        if user_id_cookie:
+            self._session_data.userId = user_id_cookie.value
+
+        cuserId_cookie = self._session_data.session.cookie_jar.filter_cookies("https://account.xiaomi.com").get("cUserId") or \
+                         self._session_data.session.cookie_jar.filter_cookies("https://sts.api.io.mi.com").get("cUserId")
+        if cuserId_cookie:
+            self._session_data.cUserId = cuserId_cookie.value
+        return True
 
     def is_authenticated(self: Self) -> bool:
         return self._session_data is not None and self._session_data.is_authenticated()
