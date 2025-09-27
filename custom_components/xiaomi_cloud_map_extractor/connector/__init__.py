@@ -27,7 +27,11 @@ from .vacuums.vacuum_roborock import RoborockCloudVacuum
 from .vacuums.vacuum_roidmi import RoidmiCloudVacuum
 from .vacuums.vacuum_unsupported import UnsupportedCloudVacuum
 from .vacuums.vacuum_viomi import ViomiCloudVacuum
-from .xiaomi_cloud.connector import XiaomiCloudConnector, XiaomiCloudDeviceInfo
+from .xiaomi_cloud.connector import (
+    XiaomiCloudConnector,
+    XiaomiCloudDeviceInfo,
+    XiaomiCloudConnectorConfig,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,16 +47,24 @@ AVAILABLE_VACUUM_PLATFORMS: dict[VacuumApi, Type[BaseXiaomiCloudVacuum]] = {v.va
 class XiaomiCloudMapExtractorConnector:
     _used_api: VacuumApi
     _config: XiaomiCloudMapExtractorConnectorConfiguration
-    _cloud_connector: XiaomiCloudConnector
+    _cloud_connector: XiaomiCloudConnector | None
     _vacuum_connector: BaseXiaomiCloudVacuum | None
     _map_cache: XiaomiCloudMapExtractorData
     _status: XiaomiCloudMapExtractorConnectorStatus
     _server: str | None
+    _session_creator: Callable[[], ClientSession]
+    _connector_config: XiaomiCloudConnectorConfig | None
 
-    def __init__(self: Self, session_creator: Callable[[], ClientSession],
-                 config: XiaomiCloudMapExtractorConnectorConfiguration) -> None:
+    def __init__(
+        self: Self,
+        session_creator: Callable[[], ClientSession],
+        config: XiaomiCloudMapExtractorConnectorConfiguration,
+        connector_config: XiaomiCloudConnectorConfig | None,
+    ) -> None:
         self._config = config
-        self._cloud_connector = XiaomiCloudConnector(session_creator, self._config.username, self._config.password)
+        self._connector_config = connector_config
+        self._session_creator = session_creator
+        self._cloud_connector = None
         self._vacuum_connector: BaseXiaomiCloudVacuum | None = None
         self._map_cache = XiaomiCloudMapExtractorData()
         self._status: XiaomiCloudMapExtractorConnectorStatus = XiaomiCloudMapExtractorConnectorStatus.UNINITIALIZED
@@ -68,6 +80,18 @@ class XiaomiCloudMapExtractorConnector:
         return self._map_cache
 
     async def _update(self: Self) -> None:
+        if self._cloud_connector is None:
+            if self._connector_config is None:
+                _LOGGER.debug("Creating a new connector...")
+                self._cloud_connector = XiaomiCloudConnector(
+                    self._session_creator, self._config.username, self._config.password
+                )
+            else:
+                _LOGGER.debug("Restoring connector configuration...")
+                self._cloud_connector = await XiaomiCloudConnector.from_config(
+                    self._connector_config, self._session_creator
+                )
+
         if not self._is_authenticated():
             _LOGGER.debug("Logging in...")
             await self._cloud_connector.login()
@@ -91,7 +115,6 @@ class XiaomiCloudMapExtractorConnector:
         self._map_cache.map_data_raw = map_raw_data
 
     def _is_authenticated(self: Self) -> bool:
-
         return self._cloud_connector.is_authenticated()
 
     async def _initialize(self: Self) -> None:

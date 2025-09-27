@@ -1,3 +1,4 @@
+from __future__ import annotations
 import asyncio
 import base64
 import datetime
@@ -32,6 +33,29 @@ _LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
+class XiaomiCloudConnectorConfig:
+    username: str
+    password: str
+    server: str
+    user_id: str
+    c_user_id: str
+    service_token: str
+    expiration: datetime.datetime
+    ssecurity: str
+    device_id: str
+
+    @classmethod
+    def from_dict(cls, data: dict[str,str] | XiaomiCloudConnectorConfig) -> XiaomiCloudConnectorConfig:
+        _LOGGER.debug("Restoring connector config from data: %s", data)
+        if isinstance(data, XiaomiCloudConnectorConfig):
+            return data
+        expiration = data['expiration']
+        if expiration is not None:
+            expiration = datetime.datetime.fromisoformat(expiration)
+        return cls(**{**data, "expiration": expiration})
+
+
+@dataclass
 class XiaomiCloudHome:
     home_id: int
     owner: int
@@ -57,11 +81,12 @@ class XiaomiCloudSessionData:
     headers: dict[str, str]
     ssecurity: str | None = None
     userId: str | None = None
+    cUserId: str | None = None
     serviceToken: str | None = None
     expiration: datetime.datetime | None = None
 
     def is_authenticated(self) -> bool:
-        return self.serviceToken is not None and self.expiration > datetime.datetime.now() - datetime.timedelta(days=1)
+        return self.serviceToken is not None and self.expiration > datetime.datetime.now() + datetime.timedelta(days=1)
 
     async def get(self: Self, url: StrOrURL, **kwargs: Unpack[_RequestOptions]):
         passed_headers = kwargs.pop("headers", {})
@@ -70,6 +95,26 @@ class XiaomiCloudSessionData:
     async def post(self: Self, url: StrOrURL, **kwargs: Unpack[_RequestOptions]) -> ClientResponse:
         passed_headers = kwargs.pop("headers", {})
         return await self.session.post(url, headers={**passed_headers, **self.headers}, **kwargs)
+
+    def apply_from_parameters(self):
+        cookie_jar = self.session.cookie_jar
+        domains = [
+            "https://account.xiaomi.com",
+            "https://api.io.mi.com",
+            "https://sts.api.io.mi.com",
+        ]
+        cookies = {
+            k: str(v)
+            for k, v in {
+                "serviceToken": self.serviceToken,
+                "yetAnotherServiceToken": self.serviceToken,
+                "userId": self.userId,
+                "cUserId": self.cUserId,
+            }.items()
+            if v is not None
+        }
+        for domain in domains:
+            cookie_jar.update_cookies(cookies, URL(domain))
 
 
 # noinspection PyBroadException
@@ -161,6 +206,7 @@ class XiaomiCloudConnector:
                 location = response_json["location"]
                 self._session_data.ssecurity = response_json["ssecurity"]
                 self._session_data.userId = response_json["userId"]
+                self._session_data.cUserId = response_json["cUserId"]
                 max_age = int(response.cookies.get("userId").get("max-age"))
                 self._session_data.expiration = datetime.datetime.now() + datetime.timedelta(seconds=max_age)
                 self.two_factor_auth_url = None
@@ -273,13 +319,6 @@ class XiaomiCloudConnector:
         _LOGGER.debug("sendEmailTicket response status=%s json=%s", r.status, jr)
 
         # 4) Ask user for the email code and verify
-        # Store session state and raise exception for Home Assistant to handle
-        session_state = {
-            "headers": headers,
-            "list_params": list_params,
-            "send_params": send_params,
-            "context": context
-        }
         _LOGGER.debug("Raising TwoFactorAuthRequiredException with url=%s, context=%s", notification_url, context)
         raise TwoFactorAuthRequiredException(
             url=notification_url,
@@ -453,6 +492,30 @@ class XiaomiCloudConnector:
                          self._session_data.session.cookie_jar.filter_cookies("https://sts.api.io.mi.com").get("cUserId")
         if cuserId_cookie:
             self._session_data.cUserId = cuserId_cookie.value
+
+        max_age = next(
+            (
+                int(cookie.get("max-age", 0))
+                for cookie in self._session_data.session.cookie_jar
+                if cookie.key == "userId" and cookie.get("max-age") is not None
+            ),
+            0,
+        )
+        if max_age == 0:
+            max_age = next(
+                (
+                    int(cookie.get("expires", 0))
+                    for cookie in self._session_data.session.cookie_jar
+                    if cookie.key == "userId" and cookie.get("expires") is not None
+                ),
+                0,
+            ) - int(datetime.datetime.now().timestamp())
+        if max_age <= 0:
+            max_age = 20 * 24 * 60 * 60
+        self._session_data.expiration = datetime.datetime.now() + datetime.timedelta(
+            seconds=max_age
+        )
+
         return True
 
     def is_authenticated(self: Self) -> bool:
@@ -560,14 +623,19 @@ class XiaomiCloudConnector:
             "MIOT-ENCRYPT-ALGORITHM": "ENCRYPT-RC4",
         }
         cookies = {
-            "userId": str(self._session_data.userId),
-            "yetAnotherServiceToken": str(self._session_data.serviceToken),
-            "serviceToken": str(self._session_data.serviceToken),
-            "locale": self._locale,
-            "timezone": self._timezone,
-            "is_daylight": str(time.daylight),
-            "dst_offset": str(time.localtime().tm_isdst * 60 * 60 * 1000),
-            "channel": "MI_APP_STORE"
+            k: str(v)
+            for k, v in {
+                "userId": self._session_data.userId,
+                "cUserId": self._session_data.cUserId,
+                "yetAnotherServiceToken": self._session_data.serviceToken,
+                "serviceToken": self._session_data.serviceToken,
+                "locale": self._locale,
+                "timezone": self._timezone,
+                "is_daylight": time.daylight,
+                "dst_offset": time.localtime().tm_isdst * 60 * 60 * 1000,
+                "channel": "MI_APP_STORE",
+            }.items()
+            if v is not None
         }
         millis = round(time.time() * 1000)
         nonce = generate_nonce(millis)
@@ -595,3 +663,36 @@ class XiaomiCloudConnector:
     def _signed_nonce(self: Self, nonce: str) -> str:
         hash_object = hashlib.sha256(base64.b64decode(self._session_data.ssecurity) + base64.b64decode(nonce))
         return base64.b64encode(hash_object.digest()).decode()
+
+    def to_config(self: Self) -> XiaomiCloudConnectorConfig:
+        return XiaomiCloudConnectorConfig(
+            self._username,
+            self._password,
+            self.server,
+            self._session_data.userId,
+            self._session_data.cUserId,
+            self._session_data.serviceToken,
+            self._session_data.expiration,
+            self._session_data.ssecurity,
+            self.device_id
+        )
+
+    @staticmethod
+    async def from_config(config: XiaomiCloudConnectorConfig, session_creator: Callable[[], ClientSession]):
+        connector = XiaomiCloudConnector(session_creator,
+                                         config.username,
+                                         config.password,
+                                         server=config.server)
+        connector.device_id = config.device_id
+
+        await connector.create_session()
+
+        connector._session_data.userId = config.user_id
+        connector._session_data.cUserId = config.c_user_id
+        connector._session_data.serviceToken = config.service_token
+        connector._session_data.ssecurity = config.ssecurity
+        connector._session_data.expiration = config.expiration
+
+        connector._session_data.apply_from_parameters()
+
+        return connector

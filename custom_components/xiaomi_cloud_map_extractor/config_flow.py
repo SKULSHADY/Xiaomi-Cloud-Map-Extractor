@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import logging
 import base64
+import logging
 from typing import Any, Self, Mapping
 
 import voluptuous as vol
@@ -23,8 +23,11 @@ from vacuum_map_parser_base.config.drawable import Drawable
 from vacuum_map_parser_base.config.image_config import ImageConfig
 from vacuum_map_parser_base.config.size import Sizes
 
-from .connector.utils.exceptions import XiaomiCloudMapExtractorException, TwoFactorAuthRequiredException, \
-    CaptchaRequiredException
+from .connector.utils.exceptions import (
+    XiaomiCloudMapExtractorException,
+    TwoFactorAuthRequiredException,
+    CaptchaRequiredException,
+)
 from .connector.vacuums.base.model import VacuumApi
 from .connector.xiaomi_cloud.connector import XiaomiCloudConnector, XiaomiCloudDeviceInfo
 from .connector.xiaomi_cloud.const import AVAILABLE_SERVERS
@@ -48,6 +51,7 @@ from .const import (
     CONF_TWO_FACTOR_CODE,
 )
 from .options_flow import XiaomiCloudMapExtractorOptionsFlowHandler
+from .store import save_connector_config
 from .types import XiaomiCloudMapExtractorConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
@@ -215,11 +219,12 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
                 existing_entry = await self.async_set_unique_id(
                     unique_id, raise_on_progress=False
                 )
+                await save_connector_config(self.hass, self._cloud_vacuum.mac, self._connector.to_config())
                 if existing_entry:
                     data = existing_entry.data.copy()
                     data[CONF_HOST] = host
                     data[CONF_TOKEN] = token
-                    data[CONF_DEVICE_ID] = self._cloud_vacuum.device_id,
+                    data[CONF_DEVICE_ID] = self._cloud_vacuum.device_id
                     data[CONF_MODEL] = self._cloud_vacuum.model
                     data[CONF_MAC] = format_mac(self._cloud_vacuum.mac)
                     data[CONF_NAME] = self._cloud_vacuum.name
@@ -227,9 +232,9 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
                     data[CONF_PASSWORD] = self._password
                     data[CONF_SERVER] = self._server
                     data[CONF_USED_MAP_API] = used_map_api
-                    return self.async_update_reload_and_abort(existing_entry, data=data)
+                    result_entry = self.async_update_reload_and_abort(existing_entry, data=data)
                 else:
-                    return self.async_create_entry(
+                    result_entry = self.async_create_entry(
                         title=self._cloud_vacuum.name,
                         data={
                             CONF_HOST: host,
@@ -255,6 +260,7 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
                             CONF_TEXTS: [],
                         }
                     )
+                return result_entry
 
         detected_api = VacuumApi.detect(self._cloud_vacuum.model)
         api_options: list[SelectOptionDict] = [

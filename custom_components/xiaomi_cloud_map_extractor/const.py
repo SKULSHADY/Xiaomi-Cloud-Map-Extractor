@@ -44,3 +44,5 @@ CONF_TEXT_Y: Final = "y"
 CONF_TEXT_COLOR: Final = "color"
 CONF_TEXT_FONT: Final = "font"
 CONF_TEXT_FONT_SIZE: Final = "font_size"
+
+STORAGE_VERSION: Final = 1
