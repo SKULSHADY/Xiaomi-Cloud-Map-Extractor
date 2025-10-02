@@ -1,12 +1,15 @@
+import logging
 from typing import Self
 
-from miio import DreameVacuum
+from miio import DreameVacuum, DeviceException
 
 from vacuum_map_parser_base.map_data import MapData
 
 from vacuum_map_parser_dreame.map_data_parser import DreameMapDataParser
 from .base.model import VacuumConfig, VacuumApi
 from .base.vacuum_v2 import BaseXiaomiCloudVacuumV2
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class DreameCloudVacuum(BaseXiaomiCloudVacuumV2):
@@ -75,7 +78,10 @@ class DreameCloudVacuum(BaseXiaomiCloudVacuumV2):
             self._robot_stamp = 0
             return map_name
         else:
-            self._dreame_vacuum.call_action("map_view", params=[{'piid': 2, 'value': '{"frame_type":"I"}'}])
+            try:
+                self._dreame_vacuum.call_action("map_view", params=[{'piid': 2, 'value': '{"frame_type":"I"}'}])
+            except DeviceException as e:
+                _LOGGER.debug("Error while calling map_view: %s", e)
             return await super().get_map_name()
 
     def store_map(self: Self, raw_map_data):

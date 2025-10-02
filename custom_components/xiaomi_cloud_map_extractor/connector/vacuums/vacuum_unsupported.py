@@ -1,4 +1,4 @@
-from typing import Self
+from typing import Self, Any
 
 from vacuum_map_parser_base.map_data import MapData
 from vacuum_map_parser_base.map_data_parser import MapDataParser
@@ -12,7 +12,7 @@ class UnsupportedCloudVacuum(BaseXiaomiCloudVacuumV2):
 
     def __init__(self: Self, vacuum_config: VacuumConfig) -> None:
         super().__init__(vacuum_config)
-        self._unsupported_map_data_parser = MapDataParser(
+        self._unsupported_map_data_parser = UnsupportedMapDataParser(
             vacuum_config.palette,
             vacuum_config.sizes,
             vacuum_config.drawables,
@@ -34,3 +34,12 @@ class UnsupportedCloudVacuum(BaseXiaomiCloudVacuumV2):
 
     def decode_and_parse(self: Self, raw_map: bytes) -> MapData | None:
         return self._unsupported_map_data_parser.create_empty(f"Vacuum\n{self.model}\nis not supported")
+
+
+class UnsupportedMapDataParser(MapDataParser):
+
+    def parse(self, raw: bytes, *args: Any, **kwargs: Any) -> MapData:
+        return MapData()
+
+    def unpack_map(self, raw_encoded: bytes, *args: Any, **kwargs: Any) -> bytes:
+        return b"NO_DATA"
