@@ -83,9 +83,7 @@ class XiaomiCloudMapExtractorConnector:
         if self._cloud_connector is None:
             if self._connector_config is None:
                 _LOGGER.debug("Creating a new connector...")
-                self._cloud_connector = XiaomiCloudConnector(
-                    self._session_creator, self._config.username, self._config.password
-                )
+                self._cloud_connector = XiaomiCloudConnector(self._session_creator)
             else:
                 _LOGGER.debug("Restoring connector configuration...")
                 self._cloud_connector = await XiaomiCloudConnector.from_config(
@@ -94,7 +92,7 @@ class XiaomiCloudMapExtractorConnector:
 
         if not self._is_authenticated():
             _LOGGER.debug("Logging in...")
-            await self._cloud_connector.login()
+            await self._cloud_connector.login_with_credentials(self._username, self._password)
             if not self._is_authenticated():
                 _LOGGER.error("Not authenticated!")
                 raise FailedLoginException()

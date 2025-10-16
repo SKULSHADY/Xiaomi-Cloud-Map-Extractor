@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import base64
 import logging
+from asyncio import Task
 from typing import Any, Self, Mapping
 
 import voluptuous as vol
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
-from homeassistant.const import (CONF_HOST, CONF_TOKEN, CONF_MAC, CONF_USERNAME, CONF_PASSWORD, CONF_MODEL,
+from homeassistant.const import (
+    CONF_HOST, CONF_TOKEN, CONF_MAC, CONF_USERNAME, CONF_PASSWORD, CONF_MODEL,
                                  CONF_DEVICE_ID, CONF_NAME)
 from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
@@ -27,6 +29,7 @@ from .connector.utils.exceptions import (
     XiaomiCloudMapExtractorException,
     TwoFactorAuthRequiredException,
     CaptchaRequiredException,
+    FailedLoginException,
 )
 from .connector.vacuums.base.model import VacuumApi
 from .connector.xiaomi_cloud.connector import XiaomiCloudConnector, XiaomiCloudDeviceInfo
@@ -56,16 +59,6 @@ from .types import XiaomiCloudMapExtractorConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
-CLOUD_SCHEMA = vol.Schema(
-    {
-        vol.Optional(CONF_USERNAME): str,
-        vol.Optional(CONF_PASSWORD): str,
-        vol.Optional(CONF_SERVER, default='de'): vol.In(
-            AVAILABLE_SERVERS
-        )
-    }
-)
-
 
 # noinspection PyTypeChecker,PyBroadException
 class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
@@ -81,6 +74,7 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
         self._connector: XiaomiCloudConnector | None = None
         self._captcha_exception: CaptchaRequiredException | None = None
         self._two_factor_exception: TwoFactorAuthRequiredException | None = None
+        self._wait_for_login_task: Task | None = None
 
     @staticmethod
     @callback
@@ -100,16 +94,27 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Dialog that informs the user that reauth is required."""
         if user_input is not None:
-            return await self.async_step_cloud()
+            return await self.async_step_auth_method_selection()
         return self.async_show_form(step_id="reauth_confirm")
 
     async def async_step_user(
             self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
-        return await self.async_step_cloud()
+        return await self.async_step_auth_method_selection()
 
-    async def async_step_cloud(
+    async def async_step_auth_method_selection(
+            self: Self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        return self.async_show_menu(
+            step_id="auth_method_selection",
+            menu_options=[
+                "auth_credentials",
+                "auth_qr"
+            ],
+        )
+
+    async def async_step_auth_credentials(
             self: Self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         errors = {}
@@ -120,9 +125,9 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
             self._server = user_input.get(CONF_SERVER)
             session_creator = lambda: async_create_clientsession(self.hass)
 
-            self._connector = XiaomiCloudConnector(session_creator, self._username, self._password, self._server)
+            self._connector = XiaomiCloudConnector(session_creator, self._server)
             try:
-                if await self._connector.login() is None:
+                if await self._connector.login_with_credentials(self._username, self._password) is None:
                     errors["base"] = "cloud_login_error"
             except CaptchaRequiredException as e:
                 self._captcha_exception = e
@@ -137,16 +142,103 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
                 _LOGGER.error(e, exc_info=True)
                 return self.async_abort(reason="unknown")
 
-            if errors:
-                return self.async_show_form(
-                    step_id="cloud", data_schema=CLOUD_SCHEMA, errors=errors
-                )
-            return await self._after_auth()
+            if not errors:
+                return await self._after_auth()
         return self.async_show_form(
-            step_id="cloud", data_schema=CLOUD_SCHEMA, errors=errors
+            step_id="auth_credentials",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(CONF_USERNAME): str,
+                    vol.Optional(CONF_PASSWORD): str,
+                    vol.Optional(CONF_SERVER, default='de'): vol.In(
+                        AVAILABLE_SERVERS
+                    )
+                }
+            ),
+            errors=errors
         )
 
-    async def _after_auth(self) -> ConfigFlowResult:
+    async def async_step_auth_qr(self:Self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+
+        # if self._connector is not None:
+        #     return await self._after_auth()
+        errors = {}
+        placeholders = {}
+
+
+        if self._wait_for_login_task is None:
+            if self._connector is None:
+                session_creator = lambda: async_create_clientsession(self.hass)
+                self._server = "de"
+                self._connector = XiaomiCloudConnector(session_creator, self._server)
+
+            try:
+                qr_data = await self._connector.login_with_qr_get_code()
+                qr_image = qr_data[0]
+                login_link = qr_data[1]
+                qr_image_b64 = base64.b64encode(qr_image).decode("utf-8")
+                placeholders["qr_image_b64"] = qr_image_b64
+                placeholders["login_link"] = login_link
+            except FailedLoginException as ex:
+                return self.async_abort(reason="qr_code_unavailable")
+
+            _wait_for_login = self._connector.login_with_qr_wait_for_completion
+            self._wait_for_login_task = self.hass.async_create_task(_wait_for_login())
+        if self._wait_for_login_task.done():
+            if self._wait_for_login_task.exception():
+                return self.async_abort(reason="cannot_connect")
+            return self.async_show_progress_done(next_step_id="after_auth")
+
+        return self.async_show_progress(
+                step_id="auth_qr",
+                progress_action="wait_for_login",
+                description_placeholders=placeholders,
+                progress_task=self._wait_for_login_task
+            )
+
+        # errors = {}
+        # if user_input is not None:
+        #
+        #     self._username = user_input.get("qr_code")
+        #     self._password = user_input.get(CONF_PASSWORD)
+        #     self._server = user_input.get(CONF_SERVER)
+        #     session_creator = lambda: async_create_clientsession(self.hass)
+        #
+        #     self._connector = XiaomiCloudConnector(session_creator, self._username, self._password, self._server)
+        #     try:
+        #         if await self._connector.login_with_credentials() is None:
+        #             errors["base"] = "cloud_login_error"
+        #     except CaptchaRequiredException as e:
+        #         self._captcha_exception = e
+        #         return await self.async_step_auth_captcha()
+        #     except TwoFactorAuthRequiredException as e:
+        #         self._two_factor_exception = e
+        #         return await self.async_step_auth_two_factor()
+        #     except XiaomiCloudMapExtractorException:
+        #         errors["base"] = "cloud_login_error"
+        #     except Exception as e:
+        #         _LOGGER.error("Unexpected exception while attempting Miio cloud login")
+        #         _LOGGER.error(e, exc_info=True)
+        #         return self.async_abort(reason="unknown")
+        #
+        #     if not errors:
+        #         return await self._after_auth()
+        # return self.async_show_form(
+        #     step_id="qr_auth",
+        #     data_schema=vol.Schema(
+        #         {
+        #             vol.Optional(CONF_SERVER, default='de'): vol.In(
+        #                 AVAILABLE_SERVERS
+        #             )
+        #         }
+        #     ),
+        #     errors=errors
+        # )
+
+    async def async_step_after_auth(self: Self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        return await self._after_auth()
+
+    async def _after_auth(self: Self) -> ConfigFlowResult:
 
         try:
             devices_raw = await self._connector.get_devices(self._server)
@@ -159,8 +251,7 @@ class XiaomiCloudMapExtractorFlowHandler(ConfigFlow, domain=DOMAIN):
 
         if not devices_raw:
             return self.async_show_form(
-                step_id="cloud",
-                data_schema=CLOUD_SCHEMA,
+                step_id="auth_method_selection",
                 errors={CONF_SERVER: "cloud_no_devices"},
             )
 

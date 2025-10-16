@@ -1,4 +1,4 @@
-from typing import Self
+from typing import Self, Any
 
 from homeassistant.const import (
     CONF_HOST,
@@ -30,6 +30,7 @@ class XiaomiCloudMapExtractorEntity(CoordinatorEntity[XiaomiCloudMapExtractorDat
     _device_id: str
     _server: str
     _used_map_api: VacuumApi
+    _attr_device_info: DeviceInfo
 
     def __init__(
             self: Self,
@@ -61,7 +62,7 @@ class XiaomiCloudMapExtractorEntity(CoordinatorEntity[XiaomiCloudMapExtractorDat
         return self.coordinator.data
 
     @property
-    def extra_state_attributes(self: Self) -> dict[str, any]:
+    def extra_state_attributes(self: Self) -> dict[str, Any]:
         data = self._data()
         if data is None:
             return {}

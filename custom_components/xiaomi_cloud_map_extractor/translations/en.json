@@ -14,7 +14,14 @@
     },
     "flow_title": "{name}",
     "step": {
-      "cloud": {
+      "auth_method_selection": {
+        "description": "Choose login method.",
+        "menu_options": {
+          "auth_credentials": "Credentials",
+          "auth_qr": "QR code/login link"
+        }
+      },
+      "auth_credentials": {
         "data": {
           "country": "Server",
           "password": "Password",
@@ -57,6 +64,9 @@
         },
         "description": "Select the vacuum to set up."
       }
+    },
+    "progress": {
+      "wait_for_login": "Scan the QR code or use [this link]({login_link}) to log in:\n![](data:image/jpeg;base64,{qr_image_b64})"
     }
   },
   "options": {

@@ -10,12 +10,12 @@ import time
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Optional, Self, Unpack
+from typing import Optional, Self, Unpack, Any
 from urllib.parse import parse_qs, urlparse
 
 import tzlocal
 from aiohttp import ClientSession, ClientResponse
-from aiohttp.client import _RequestOptions
+from aiohttp.client import _RequestOptions, ClientTimeout
 from aiohttp.typedefs import StrOrURL
 from yarl import URL
 
@@ -34,8 +34,8 @@ _LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class XiaomiCloudConnectorConfig:
-    username: str
-    password: str
+    username: str | None
+    password: str | None
     server: str
     user_id: str
     c_user_id: str
@@ -119,24 +119,25 @@ class XiaomiCloudSessionData:
 
 # noinspection PyBroadException
 class XiaomiCloudConnector:
-    _username: str
-    _password: str
+    _username: str | None
+    _password: str | None
+    _long_polling_url: str | None
     _session_data: XiaomiCloudSessionData | None
     _locale: str
     _timezone: str
     _sign: str | None
     server: str | None
 
-    def __init__(self: Self, session_creator: Callable[[], ClientSession], username: str, password: str,
-                 server: str | None = None):
-        self._username = username
-        self._password = password
+    def __init__(self: Self, session_creator: Callable[[], ClientSession], server: str | None = None):
+        self._username = None
+        self._password = None
         self._session_creator = session_creator
         self._locale = locale.getdefaultlocale()[0] or "en_GB"
         timezone = datetime.datetime.now(tzlocal.get_localzone()).strftime('%z')
         self._timezone = f"GMT{timezone[:-2]}:{timezone[-2:]}"
         self.server = server
         self._session_data = None
+        self._long_polling_url = None
         self.device_id = generate_device_id()
 
     async def create_session(self: Self) -> None:
@@ -154,7 +155,21 @@ class XiaomiCloudConnector:
 
         self._session_data = XiaomiCloudSessionData(session, headers)
 
-    async def _login_step_1(self: Self) -> str:
+    async def login_with_credentials(self: Self, username: str, password: str) -> str | None:
+        self._username = username
+        self._password = password
+        _LOGGER.debug("Logging in...")
+        await self.create_session()
+        sign = await self._login_with_credentials_step_1()
+        if not sign.startswith('http'):
+            location = await self._login_with_credentials_step_2(sign)
+        else:
+            location = sign
+        await self._login_with_credentials_step_3(location)
+        _LOGGER.debug("Logged in.")
+        return self._session_data.serviceToken
+
+    async def _login_with_credentials_step_1(self: Self) -> str:
         _LOGGER.debug("Xiaomi cloud login - step 1")
         url = "https://account.xiaomi.com/pass/serviceLogin?sid=xiaomiio&_json=true"
         cookies = {
@@ -179,7 +194,7 @@ class XiaomiCloudConnector:
         _LOGGER.debug("Xiaomi cloud login - step 1 sign missing")
         return ""
 
-    async def _login_step_2(self: Self, sign: str, captcha_code: str | None = None) -> str:
+    async def _login_with_credentials_step_2(self: Self, sign: str, captcha_code: str | None = None) -> str:
         _LOGGER.debug("Xiaomi cloud login - step 2")
         url = "https://account.xiaomi.com/pass/serviceLoginAuth2"
         params = {
@@ -228,7 +243,7 @@ class XiaomiCloudConnector:
                     raise CaptchaRequiredException(captcha_url, captcha_data)
         raise InvalidCredentialsException()
 
-    async def _login_step_3(self: Self, location: str) -> None:
+    async def _login_with_credentials_step_3(self: Self, location: str) -> None:
         _LOGGER.debug("Xiaomi cloud login - step 3 (location: %s)", location)
         try:
             response = await self._session_data.get(location)
@@ -242,23 +257,91 @@ class XiaomiCloudConnector:
         else:
             raise InvalidCredentialsException()
 
-    async def login(self: Self) -> str | None:
-        _LOGGER.debug("Logging in...")
+    async def login_with_qr_get_code(self: Self) -> tuple[bytes, str]:
         await self.create_session()
-        sign = await self._login_step_1()
-        if not sign.startswith('http'):
-            location = await self._login_step_2(sign)
-        else:
-            location = sign
-        await self._login_step_3(location)
-        _LOGGER.debug("Logged in.")
-        return self._session_data.serviceToken
+
+        resp = await self._session_data.get("https://account.xiaomi.com/pass/serviceLogin?sid=xiaomiio&_json=true")
+        if resp.status != 200:
+            _LOGGER.debug("Step 1 of QR login failed (code %s): %s", resp.status, await resp.text())
+            raise FailedLoginException("Step 1 of QR login failed")
+
+        # step 2
+        json_resp = to_json(await resp.text())
+        location = json_resp["location"]
+        location_parsed = dict(URL(location).query)
+
+        data = {
+            "_qrsize": "480",
+            "qs": json_resp["qs"],
+            "bizDeviceType": "",
+            "callback": json_resp["callback"],
+            "_json": "true",
+            "theme": "",
+            "sid": "xiaomiio",
+            "needTheme": "false",
+            "showActiveX": "false",
+            "serviceParam": location_parsed["serviceParam"],
+            "_local": "zh_CN",
+            "_sign": json_resp["_sign"],
+            "_dc": str(int(time.time() * 1000)),
+        }
+        url = URL("https://account.xiaomi.com/longPolling/loginUrl").with_query(data)
+        resp = await self._session_data.get(url)
+
+        if resp.status != 200:
+            _LOGGER.debug("Xiaomi cloud qr login - Failed to obtain the QR code URL (code %s): %s", resp.status, await resp.text())
+            raise FailedLoginException('Failed to obtain the QR code URL')
+
+        json_resp = to_json(await resp.text())
+        if json_resp["code"] != 0:
+            _LOGGER.debug("Xiaomi cloud qr login - QR code unavailable (code %s): %s", json_resp['code'], json_resp['desc'])
+            raise FailedLoginException("QR code unavailable")
+
+        _LOGGER.debug("Xiaomi cloud qr login - JSON response: %s", json_resp)
+        qr_response = await self._session_data.get(json_resp["qr"])
+        qr_data = await qr_response.read()
+        self._long_polling_url = json_resp["lp"]
+
+        return qr_data, json_resp["loginUrl"]
+
+    async def login_with_qr_wait_for_completion(self: Self) -> None:
+        try:
+            resp = await self._session_data.get(self._long_polling_url,
+                                                timeout=ClientTimeout(total=60),
+                                                headers={'Connection': 'keep-alive'})
+        except asyncio.TimeoutError:
+            _LOGGER.debug("Xiaomi cloud qr login - Timeout, please try again")
+            raise FailedLoginException("Timeout, please try again")
+        if resp.status != 200:
+            _LOGGER.debug("Xiaomi cloud qr login - Long polling failed (code %s): %s", resp.status, await resp.text())
+            raise FailedLoginException("Long polling failed, please try again")
+
+        json_resp = to_json(await resp.text())
+        max_age = int(resp.cookies.get("userId").get("max-age"))
+
+        if json_resp['code'] != 0:
+            _LOGGER.debug("Xiaomi cloud qr login - Long polling succeeded, but returned error %s: %s", json_resp['code'], json_resp['desc'])
+            raise FailedLoginException("Long polling succeeded, but returned error")
+
+        resp = await self._session_data.get(json_resp["location"])
+        if resp.status != 200:
+            _LOGGER.debug("Xiaomi cloud qr login - Failed to obtain last jump position %s: %s", resp.status, await resp.text())
+            raise FailedLoginException("Failed to obtain last jump position")
+
+        _LOGGER.debug("Xiaomi cloud qr login - JSON response polling: %s", json_resp)
+
+        self._session_data.userId = json_resp["userId"]
+        self._session_data.ssecurity = json_resp["ssecurity"]
+
+        self._session_data.serviceToken = resp.cookies.get("serviceToken").value
+        self._session_data.expiration = datetime.datetime.now() + datetime.timedelta(seconds=max_age)
+        _LOGGER.debug("Xiaomi cloud qr login - session data: %s", self._session_data)
 
     async def continue_login_with_captcha(self: Self, captcha_code: str) -> str | None:
         _LOGGER.debug("Continuing login with captcha entered.")
 
-        location = await self._login_step_2(self._sign, captcha_code)
-        await self._login_step_3(location)
+        location = await self._login_with_credentials_step_2(self._sign, captcha_code)
+        await self._login_with_credentials_step_3(location)
 
         _LOGGER.debug("Logged in.")
         return self._session_data.serviceToken
@@ -609,14 +692,14 @@ class XiaomiCloudConnector:
         matching_token = filter(lambda device: device.token == token, devices)
         return next(matching_token, None)
 
-    async def get_other_info(self: Self, device_id: str, method: str, parameters: dict) -> any:
+    async def get_other_info(self: Self, device_id: str, method: str, parameters: dict) -> Any:
         url = self.get_api_url('sg') + "/v2/home/rpc/" + device_id
         params = {
             "data": json.dumps({"method": method, "params": parameters}, separators=(",", ":"))
         }
         return await self.execute_api_call_encrypted(url, params)
 
-    async def execute_api_call_encrypted(self: Self, url: str, params: dict[str, str]) -> any:
+    async def execute_api_call_encrypted(self: Self, url: str, params: dict[str, str]) -> Any:
         headers = {
             "Accept-Encoding": "identity",
             "x-xiaomi-protocal-flag-cli": "PROTOCAL-HTTP2",
@@ -680,9 +763,9 @@ class XiaomiCloudConnector:
     @staticmethod
     async def from_config(config: XiaomiCloudConnectorConfig, session_creator: Callable[[], ClientSession]):
         connector = XiaomiCloudConnector(session_creator,
-                                         config.username,
-                                         config.password,
                                          server=config.server)
+        connector._username = config.username
+        connector._password = config.password
         connector.device_id = config.device_id
 
         await connector.create_session()
