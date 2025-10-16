@@ -18,7 +18,7 @@
         "description": "Choose login method.",
         "menu_options": {
           "auth_credentials": "Credentials",
-          "auth_qr": "QR code/login link"
+          "auth_qr_server": "QR code/login link"
         }
       },
       "auth_credentials": {
@@ -28,6 +28,12 @@
           "username": "Username"
         },
         "description": "Log in to the Xiaomi Miio cloud, see https://www.openhab.org/addons/bindings/miio/#country-servers for the cloud server to use."
+      },
+      "auth_qr_server": {
+        "data": {
+          "username": "Username"
+        },
+        "description": "Choose the server of Xiaomi Miio cloud, see https://www.openhab.org/addons/bindings/miio/#country-servers for more info."
       },
       "auth_captcha": {
         "data": {
